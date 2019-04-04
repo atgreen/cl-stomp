@@ -395,7 +395,7 @@
         ;; The receive loop
         (let ((recvbuf '()))
           (loop until terminate
-                do (let ((sock (car (usocket:wait-for-input socket :timeout 1))))
+                do (let ((sock (car (usocket:wait-for-input socket :timeout 1 :ready-only t))))
                      (when sock
                        (let ((newbuf (append recvbuf (receive conn))))
                          (setf recvbuf (process-receive-buffer conn newbuf)))))))
