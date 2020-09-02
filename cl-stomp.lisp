@@ -349,6 +349,7 @@
          :initarg :port)
    (stream :initform nil
            :initarg :stream)
+   (stream-write-lock :initform (bt:make-lock))
    (encoding :initform :utf-8)           ;only utf-8 is currently supported
    (registrations :type list
                   :initform ()
@@ -380,7 +381,7 @@
       ((t (lambda (e)
             (disconnect conn)
             (log-debug "Error: ~A" e))))
-    (with-slots (host port stream registrations terminate) conn
+    (with-slots (host port stream stream-write-lock registrations terminate) conn
       (usocket:with-client-socket (socket strm host port
                                    :protocol :stream
                                    :element-type '(unsigned-byte 8))
@@ -411,9 +412,12 @@
 (defmethod connect ((conn connection) &optional username passcode)
   (check-type username (or null string))
   (check-type passcode (or null string))
-  (sending-frame (conn frame "CONNECT"
-                       "login" username
-                       "passcode" passcode)))
+  (with-slots (host) conn
+    (sending-frame (conn frame "CONNECT"
+                         "accept-version" "1.1,1.0"
+                         "host" host
+                         "login" username
+                         "passcode" passcode))))
 
 (defmethod disconnect ((conn connection))
   (with-slots (stream) conn
@@ -428,9 +432,10 @@
                (write-string (render-frame frame conn) stream))))
 
 (defmethod send ((conn connection) (string string))
-  (with-slots (stream encoding) conn 
-    (write-sequence (babel:string-to-octets string :encoding encoding) stream)
-    (finish-output stream)))
+  (with-slots (stream stream-write-lock encoding) conn
+    (bt:with-lock-held (stream-write-lock)
+      (write-sequence (babel:string-to-octets string :encoding encoding) stream)
+      (finish-output stream))))
 
 (defmethod receive ((conn connection))
   "Called whenever there's activity on the connection stream.
@@ -455,6 +460,25 @@
   "Try to extract and process frame(s) from buffer.  Returns unprocessed buffer."
   (labels ((process-frame (frame)
              (log-debug "Frame: ~A" frame)
+             (with-slots (name headers) frame
+               (when (string= name "CONNECTED")
+                 ;; Initiate heart-beat thread when required.
+                 (let ((heart-beat (assoc :heart-beat headers :test #'header=)))
+                   (when heart-beat
+                     (multiple-value-bind (sx sy) 
+                         (string-split (cadr heart-beat) ",")
+                       (let ((period-ms (parse-integer sy)))
+                         (when (> period-ms 0)
+                           (with-slots (stream stream-write-lock terminate) conn
+                             (bt:make-thread
+                              (lambda ()
+                                (loop until terminate
+                                      do (progn
+                                           (sleep (/ period-ms 1000))
+                                           (log-debug "sending heartbeat")
+                                           (bt:with-lock-held (stream-write-lock)
+                                             (write-byte 10 stream)
+                                             (finish-output stream))))))))))))))
              (apply-callbacks conn frame))
            (extract-frame ()
              ;; Identify frames by looking for NULLs
